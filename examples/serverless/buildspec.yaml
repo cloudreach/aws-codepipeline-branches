@@ -1,0 +1,16 @@
+version: 0.2
+
+env:
+  variables:
+    PACKAGE_FILE: 'pipeline.pkg.yaml'
+
+phases:
+  build:
+    commands:
+      - echo "Packaging template ${DEPLOY_FILE}, pushing to ${S3_BUCKET} ..."
+      - aws cloudformation package --template-file "${DEPLOY_FILE}" --s3-bucket "${S3_BUCKET}" --output-template-file "${PACKAGE_FILE}"
+      - aws cloudformation validate-template --template-body file://${PACKAGE_FILE}
+
+artifacts:
+  files:
+    - ${PACKAGE_FILE}

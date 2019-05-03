@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: 'Creates branch-build-enabled CodeCommit repository'
+Parameters:
+
+  ApplicationName:
+    Type: String
+    Description: 'The name of the application, this will also be the repository name'
+
+  LayerBundleS3Bucket:
+    Type: String
+    Description: 'The S3 bucket where the layer bundle is stored and the cloudformation'
+
+  LayerBundleS3Key:
+    Type: String
+    Description: 'The S3 key to the layer bundle'
+
+  RetentionPolicyInDays:
+    Type: String
+    Default: 90
+    Description: 'How long to retain build artifacts and logs'
+
+  PipelineTemplatePath:
+    Type: String
+    Description: 'The path in the repository to the CloudFormation template that creates the pipeline'
+    Default: 'pipeline.yaml'
+
+Resources:
+
+  # Creates a layer containing the latest boto3 library (for codecommit getfile methods)
+  Boto3Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.6
+      Content:
+        S3Bucket: !Ref LayerBundleS3Bucket
+        S3Key: !Ref LayerBundleS3Key
+      Description: 'Latest boto3'
+      LayerName: boto3-latest
+      LicenseInfo: MIT
+
+  # Create the CodeCommit repository for application source code to be stored in
+  CodeCommitRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref ApplicationName
+      RepositoryDescription: !Sub 'This repository is managed by CloudFormation stack ${AWS::StackName}'
+      Triggers:
+        - Name: 'CodeCommitBranchHandler'
+          DestinationArn: !GetAtt CodeCommitBranchHandler.Arn
+          Events:
+            - all
+
+  # Create an S3 bucket for pipeline to push artifacts to
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: 'Private'
+      BucketName: !Sub '${ApplicationName}-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}'
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: !Ref RetentionPolicyInDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+  # Listener for codecommit events
+  CodeCommitBranchHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.6
+      Handler: lambda_handler.handler
+      CodeUri: ./src
+      Layers: [!Ref Boto3Layer]
+      Timeout: 900
+      Policies:
+        - AdministratorAccess
+      Environment:
+        Variables:
+          APPLICATION_NAME: !Ref ApplicationName
+          ARTIFACT_BUCKET_ARN: !GetAtt PipelineArtifactsBucket.Arn
+          ARTIFACT_BUCKET_NAME: !Ref PipelineArtifactsBucket
+          LOG_LEVEL: INFO
+          PIPELINE_FILE: !Ref PipelineTemplatePath
+          RETENTION_POLICY_IN_DAYS: !Ref RetentionPolicyInDays
+
+  # Give the codecommit repository permission to invoke the function
+  CodeCommitBranchHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref CodeCommitBranchHandler
+      Principal: 'codecommit.amazonaws.com'
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt CodeCommitRepository.Arn
+
+
+  # Specify the log retention policy on the lambda log groups
+  CodeCommitBranchHandlerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CodeCommitBranchHandler}'
+      RetentionInDays: !Ref RetentionPolicyInDays
+
+Outputs:
+
+  CloneUrlHttp:
+    Description: The endpoint used to push to the code repo over HTTP
+    Value: !GetAtt 'CodeCommitRepository.CloneUrlHttp'
+
+  CloneUrlSsh:
+    Description: The endpoint used to push to the code repo over SSH
+    Value: !GetAtt 'CodeCommitRepository.CloneUrlSsh'

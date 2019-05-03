@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation Templates for building a pipelines that uses CloudFormation to deploy'
+Parameters:
+
+  Branch:
+    Type: String
+
+  PipelineName:
+    Type: String
+
+  CommitId:
+    Type: String
+
+  ApplicationName:
+    Type: String
+
+  ArtifactBucketArn:
+    Type: String
+
+  ArtifactBucketName:
+    Type: String
+
+  CodeCommitRepositoryArn:
+    Type: String
+
+  CodeCommitRepositoryName:
+    Type: String
+
+  PipelineFile:
+    Type: String
+
+  RetentionPolicyInDays:
+    Type: String
+
+Conditions:
+  IsMasterCondition: !Equals [!Ref Branch, 'master']
+
+Resources:
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'pipeline-${PipelineName}'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - 'codebuild.amazonaws.com'
+                - 'codepipeline.amazonaws.com'
+                - 'cloudformation.amazonaws.com'
+                - 'lambda.amazonaws.com'
+      Path: /
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AdministratorAccess']
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Name: !Sub '${PipelineName}-build'
+      ServiceRole: !GetAtt 'Role.Arn'
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: 'examples/serverless/buildspec.yaml'
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:1.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: APPLICATION_NAME
+            Value: !Ref ApplicationName
+          - Name: BRANCH_NAME
+            Value: !Ref Branch
+          - Name: DEPLOY_FILE
+            Value: examples/serverless/deploy.yaml
+          - Name: S3_BUCKET
+            Value: !Ref ArtifactBucketName
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref 'ArtifactBucketName'
+        Type: S3
+      Name: !Ref PipelineName
+      RoleArn: !GetAtt 'Role.Arn'
+      Stages:
+
+        - Name: Source
+          Actions:
+            - Name: SourceFetch
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                BranchName: !Ref Branch
+                PollForSourceChanges: False
+                RepositoryName: !Ref 'CodeCommitRepositoryName'
+              InputArtifacts: []
+              OutputArtifacts:
+                - Name: Source
+              RunOrder: 1
+
+        - Name: BuildAndDeploy
+          Actions:
+            - Name: BuildDocker
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref 'BuildProject'
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: Template
+              RunOrder: 1
+
+#            - !If
+#              - IsMasterCondition
+            - Name: CloudFormation
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: 1
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+                RoleArn: !GetAtt 'Role.Arn'
+                StackName: !Sub '${PipelineName}-deploy'
+                TemplatePath: Template::pipeline.pkg.yaml
+                ParameterOverrides: !Sub |
+                  {
+                    "Stage" : "${Branch}"
+                  }
+              InputArtifacts:
+                - Name: Template
+              RunOrder: 2
+#              - !Ref 'AWS::NoValue'
+
+  # Creates a lambda that will delete the deployed stack when the pipeline is deleted
+  UndeployLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python2.7
+      Timeout: 600
+      Role: !GetAtt Role.Arn
+      Handler: 'index.handler'
+      Code:
+        ZipFile: !Sub |
+          import json
+          import logging
+          import signal
+          from urllib2 import build_opener, HTTPHandler, Request
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          STACK_NAME = '${PipelineName}-deploy'
+
+          def handler(event, context):
+            try:
+              LOGGER.info('Received {}, {}'.format(event, context))
+
+              if event['RequestType'] == 'Delete':
+                  LOGGER.info('Deleting cloudformation stack {}'.format(STACK_NAME))
+                  boto3.client('cloudformation').delete_stack(StackName=STACK_NAME)
+                  send_response(event, context, "SUCCESS", {"Message": "Resource deletion successful!"})
+              else:
+                  LOGGER.info('Nothing to be done')
+                  send_response(event, context, "SUCCESS", {"Message": "Nothing to be done"})
+            except:
+              LOGGER.info('FAILED!')
+              send_response(event, context, "FAILED", {"Message": "Exception during processing"})
+
+          def send_response(event, context, response_status, response_data):
+              '''Send a resource manipulation status response to CloudFormation'''
+              response_body = json.dumps({
+                  "Status": response_status,
+                  "Reason": "See the details in CloudWatch Log Stream: " + context.log_stream_name,
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event['StackId'],
+                  "RequestId": event['RequestId'],
+                  "LogicalResourceId": event['LogicalResourceId'],
+                  "Data": response_data
+              })
+
+              LOGGER.info('ResponseURL: %s', event['ResponseURL'])
+              LOGGER.info('ResponseBody: %s', response_body)
+
+              opener = build_opener(HTTPHandler)
+              request = Request(event['ResponseURL'], data=response_body)
+              request.add_header('Content-Type', '')
+              request.add_header('Content-Length', len(response_body))
+              request.get_method = lambda: 'PUT'
+              response = opener.open(request)
+              LOGGER.info("Status code: %s", response.getcode())
+              LOGGER.info("Status message: %s", response.msg)
+
+
+  # Specify the retention policy on the log group
+  UndeployLambdaLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UndeployLambda}'
+      RetentionInDays: !Ref RetentionPolicyInDays
+
+
+  # When this resource is deleted, it will remove the stack that was deployed
+  UndeployCustomResource:
+    Type: "AWS::CloudFormation::CustomResource"
+    Properties:
+      ServiceToken: !GetAtt 'UndeployLambda.Arn'

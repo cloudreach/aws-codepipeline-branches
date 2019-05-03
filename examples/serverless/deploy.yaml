@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation Template for deploying a simple serverless application'
+Transform: 'AWS::Serverless-2016-10-31'
+
+Parameters:
+
+  Stage:
+    Type: String
+
+Resources:
+
+  # Create an API Gateway
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          title: !Ref 'AWS::StackName'
+        paths:
+          "/":
+            get:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:ServerlessDemo-${Stage}/invocations'
+              responses: {}
+
+  # Create the function
+  Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'ServerlessDemo-${Stage}'
+      Runtime: python3.6
+      Handler: lambda.handler
+      CodeUri: .
+      Events:
+        GetRoot:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /
+            Method: GET
